@@ -467,6 +467,30 @@ async function ghUpdateRef(branch, commitSha) {
   if (!res.ok) throw new Error(await describeError(res));
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// GitHub's API occasionally throws a transient "GitRPC::BadObjectState" error right after
+// creating several blobs in quick succession, before they're fully settled on GitHub's side.
+// Retrying after a short pause resolves it almost every time.
+async function withRetry(fn, { retries = 4, delayMs = 900 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const isTransient = /BadObjectState|not found|rate limit/i.test(err.message || '');
+      if (attempt === retries || !isTransient) throw err;
+      const statusEl = document.getElementById('pushStatus');
+      if (statusEl) statusEl.textContent = `GitHub still settling, retrying (${attempt + 1}/${retries})…`;
+      await sleep(delayMs * (attempt + 1));
+    }
+  }
+  throw lastErr;
+}
+
 function setBusy(text) {
   document.getElementById('busyText').textContent = text || 'Working…';
   document.getElementById('busyOverlay').classList.add('show');
@@ -540,9 +564,16 @@ async function pushAllChanges() {
       treeEntries.push({ path: 'announcement.json', mode: '100644', type: 'blob', sha });
     }
 
-    const newTreeSha = await ghCreateTree(baseTreeSha, treeEntries);
-    const newCommitSha = await ghCreateCommit(message, newTreeSha, latestCommitSha);
-    await ghUpdateRef(branch, newCommitSha);
+    // Give GitHub's backend a moment to fully settle the blobs just created above
+    // before referencing them in a tree — avoids the transient GitRPC::BadObjectState error.
+    if (treeEntries.length > 0) {
+      statusEl.textContent = 'Finalizing…';
+      await sleep(1200);
+    }
+
+    const newTreeSha = await withRetry(() => ghCreateTree(baseTreeSha, treeEntries));
+    const newCommitSha = await withRetry(() => ghCreateCommit(message, newTreeSha, latestCommitSha));
+    await withRetry(() => ghUpdateRef(branch, newCommitSha));
 
     pendingUploads = {};
     pendingDeletes.clear();
