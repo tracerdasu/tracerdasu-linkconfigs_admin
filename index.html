@@ -467,6 +467,62 @@ async function ghUpdateRef(branch, commitSha) {
   if (!res.ok) throw new Error(await describeError(res));
 }
 
+/* ---------------- Contents API fallback (one commit per file, used if the batched approach fails) ---------------- */
+function b64EncodeUnicode(str) {
+  return btoa(unescape(encodeURIComponent(str)));
+}
+async function ghContentsGetSha(path) {
+  const { owner, repo, branch } = getConn();
+  const res = await fetch(
+    `${GH_API}/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}`,
+    { headers: ghHeaders() }
+  );
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(await describeError(res));
+  return (await res.json()).sha;
+}
+async function ghContentsPut(path, content, isBase64, message) {
+  const { owner, repo, branch } = getConn();
+  const existingSha = await ghContentsGetSha(path);
+  const body = { message, content: isBase64 ? content : b64EncodeUnicode(content), branch };
+  if (existingSha) body.sha = existingSha;
+  const res = await fetch(`${GH_API}/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`, {
+    method: 'PUT',
+    headers: { ...ghHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(await describeError(res));
+}
+async function ghContentsDelete(path, message) {
+  const sha = await ghContentsGetSha(path);
+  if (!sha) return; // already gone, nothing to do
+  const { owner, repo, branch } = getConn();
+  const res = await fetch(`${GH_API}/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`, {
+    method: 'DELETE',
+    headers: { ...ghHeaders(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, sha, branch }),
+  });
+  if (!res.ok) throw new Error(await describeError(res));
+}
+async function pushViaContentsApiFallback(message, onProgress) {
+  for (const [path, base64] of Object.entries(pendingUploads)) {
+    if (onProgress) onProgress('Uploading ' + path.split('/').pop() + '…');
+    await ghContentsPut(path, base64, true, message);
+  }
+  for (const path of pendingDeletes) {
+    if (onProgress) onProgress('Removing ' + path.split('/').pop() + '…');
+    await ghContentsDelete(path, message);
+  }
+  if (manifestDirty()) {
+    if (onProgress) onProgress('Saving manifest.json…');
+    await ghContentsPut('manifest.json', JSON.stringify(manifest, null, 2), false, message);
+  }
+  if (announcementDirty()) {
+    if (onProgress) onProgress('Saving announcement.json…');
+    await ghContentsPut('announcement.json', JSON.stringify(announcement, null, 2), false, message);
+  }
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -534,6 +590,39 @@ async function discardChanges() {
 }
 
 /* ---------------- Push everything staged, as ONE commit ---------------- */
+async function attemptBatchedPush(message, statusEl) {
+  const { branch } = getConn();
+  const latestCommitSha = await ghGetRefCommitSha(branch);
+  const baseTreeSha = await ghGetCommitTreeSha(latestCommitSha);
+
+  const treeEntries = [];
+
+  for (const [path, base64] of Object.entries(pendingUploads)) {
+    const blobSha = await ghCreateBlob(base64, 'base64');
+    treeEntries.push({ path, mode: '100644', type: 'blob', sha: blobSha });
+  }
+  for (const path of pendingDeletes) {
+    treeEntries.push({ path, mode: '100644', type: 'blob', sha: null });
+  }
+  if (manifestDirty()) {
+    const sha = await ghCreateBlob(JSON.stringify(manifest, null, 2), 'utf-8');
+    treeEntries.push({ path: 'manifest.json', mode: '100644', type: 'blob', sha });
+  }
+  if (announcementDirty()) {
+    const sha = await ghCreateBlob(JSON.stringify(announcement, null, 2), 'utf-8');
+    treeEntries.push({ path: 'announcement.json', mode: '100644', type: 'blob', sha });
+  }
+
+  if (treeEntries.length > 0) {
+    statusEl.textContent = 'Finalizing…';
+    await sleep(1200);
+  }
+
+  const newTreeSha = await withRetry(() => ghCreateTree(baseTreeSha, treeEntries));
+  const newCommitSha = await withRetry(() => ghCreateCommit(message, newTreeSha, latestCommitSha));
+  await withRetry(() => ghUpdateRef(branch, newCommitSha));
+}
+
 async function pushAllChanges() {
   if (!requireConnected()) return;
   if (pendingCount() === 0) { showToast('Nothing to push'); return; }
@@ -541,40 +630,28 @@ async function pushAllChanges() {
   const statusEl = document.getElementById('pushStatus');
   setBusy('Pushing to GitHub…');
   statusEl.textContent = 'Pushing…';
+
+  let succeeded = false;
+  let usedFallback = false;
+
   try {
-    const { branch } = getConn();
-    const latestCommitSha = await ghGetRefCommitSha(branch);
-    const baseTreeSha = await ghGetCommitTreeSha(latestCommitSha);
-
-    const treeEntries = [];
-
-    for (const [path, base64] of Object.entries(pendingUploads)) {
-      const blobSha = await ghCreateBlob(base64, 'base64');
-      treeEntries.push({ path, mode: '100644', type: 'blob', sha: blobSha });
+    await attemptBatchedPush(message, statusEl);
+    succeeded = true;
+  } catch (batchErr) {
+    // The single-commit approach failed (including after its own retries) — fall back to
+    // committing each change individually. Slower and makes more than one commit, but reliable.
+    statusEl.textContent = 'Single-commit push didn\'t go through, trying a different way…';
+    try {
+      await pushViaContentsApiFallback(message, (msg) => { statusEl.textContent = msg; });
+      succeeded = true;
+      usedFallback = true;
+    } catch (fallbackErr) {
+      statusEl.textContent = 'Push failed: ' + fallbackErr.message;
+      showToast('Push failed: ' + fallbackErr.message, true);
     }
-    for (const path of pendingDeletes) {
-      treeEntries.push({ path, mode: '100644', type: 'blob', sha: null });
-    }
-    if (manifestDirty()) {
-      const sha = await ghCreateBlob(JSON.stringify(manifest, null, 2), 'utf-8');
-      treeEntries.push({ path: 'manifest.json', mode: '100644', type: 'blob', sha });
-    }
-    if (announcementDirty()) {
-      const sha = await ghCreateBlob(JSON.stringify(announcement, null, 2), 'utf-8');
-      treeEntries.push({ path: 'announcement.json', mode: '100644', type: 'blob', sha });
-    }
+  }
 
-    // Give GitHub's backend a moment to fully settle the blobs just created above
-    // before referencing them in a tree — avoids the transient GitRPC::BadObjectState error.
-    if (treeEntries.length > 0) {
-      statusEl.textContent = 'Finalizing…';
-      await sleep(1200);
-    }
-
-    const newTreeSha = await withRetry(() => ghCreateTree(baseTreeSha, treeEntries));
-    const newCommitSha = await withRetry(() => ghCreateCommit(message, newTreeSha, latestCommitSha));
-    await withRetry(() => ghUpdateRef(branch, newCommitSha));
-
+  if (succeeded) {
     pendingUploads = {};
     pendingDeletes.clear();
     lastPushedManifestJSON = JSON.stringify(manifest);
@@ -584,10 +661,7 @@ async function pushAllChanges() {
     renderLocations();
     renderAnnouncementForm();
     statusEl.textContent = `Pushed · ${new Date().toLocaleTimeString()}`;
-    showToast('Pushed to GitHub — one commit, all changes included');
-  } catch (err) {
-    statusEl.textContent = 'Push failed: ' + err.message;
-    showToast('Push failed: ' + err.message, true);
+    showToast(usedFallback ? 'Pushed to GitHub (as a few separate commits)' : 'Pushed to GitHub — one commit, all changes included');
   }
   clearBusy();
 }
